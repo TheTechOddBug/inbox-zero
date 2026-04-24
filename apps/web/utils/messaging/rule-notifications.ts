@@ -5,6 +5,8 @@ import {
   Card,
   CardText,
   LinkButton,
+  Select,
+  SelectOption,
   type ActionEvent,
   type CardElement,
   type CardChild,
@@ -69,6 +71,9 @@ const RULE_DRAFT_EDIT_ACTION_ID = "rule_draft_edit";
 const RULE_DRAFT_DISMISS_ACTION_ID = "rule_draft_dismiss";
 const RULE_NOTIFY_ARCHIVE_ACTION_ID = "rule_notify_archive";
 const RULE_NOTIFY_MARK_READ_ACTION_ID = "rule_notify_mark_read";
+const RULE_NOTIFY_MORE_ACTION_ID = "rule_notify_more";
+const RULE_NOTIFY_TRASH_ACTION_ID = "rule_notify_trash";
+const RULE_NOTIFY_MARK_SPAM_ACTION_ID = "rule_notify_mark_spam";
 export const SLACK_DRAFT_EDIT_MODAL_ID = "rule_draft_edit_modal";
 const SLACK_DRAFT_EDIT_FIELD_ID = "draft_content";
 
@@ -78,6 +83,10 @@ export const RULE_NOTIFICATION_ACTION_IDS = [
   RULE_DRAFT_DISMISS_ACTION_ID,
   RULE_NOTIFY_ARCHIVE_ACTION_ID,
   RULE_NOTIFY_MARK_READ_ACTION_ID,
+  RULE_NOTIFY_MORE_ACTION_ID,
+  // Keep legacy direct listeners for Slack cards posted before destructive actions moved into More.
+  RULE_NOTIFY_TRASH_ACTION_ID,
+  RULE_NOTIFY_MARK_SPAM_ACTION_ID,
 ] as const;
 
 type NotificationContext = NonNullable<
@@ -499,8 +508,8 @@ export async function handleRuleNotificationAction({
   event: ActionEvent;
   logger: Logger;
 }) {
-  const executedActionId = event.value?.trim();
-  if (!executedActionId) {
+  const selection = getRuleNotificationActionSelection(event);
+  if (!selection) {
     await postNotificationFeedback({
       event,
       logger,
@@ -512,14 +521,14 @@ export async function handleRuleNotificationAction({
   const context =
     event.adapter.name === "telegram"
       ? await getAuthorizedTelegramNotificationContext({
-          executedActionId,
+          executedActionId: selection.executedActionId,
           logger,
           chatId: getTelegramChatId(event),
           userId: event.user.userId,
           event,
         })
       : await getAuthorizedSlackNotificationContext({
-          executedActionId,
+          executedActionId: selection.executedActionId,
           logger,
           teamId: getSlackTeamId(event.raw),
           userId: event.user.userId,
@@ -527,7 +536,7 @@ export async function handleRuleNotificationAction({
         });
   if (!context) return;
 
-  switch (event.actionId) {
+  switch (selection.actionId) {
     case RULE_DRAFT_SEND_ACTION_ID:
       await handleDraftSend({ context, event, logger });
       return;
@@ -550,6 +559,12 @@ export async function handleRuleNotificationAction({
       return;
     case RULE_NOTIFY_MARK_READ_ACTION_ID:
       await handleMarkReadNotification({ context, event, logger });
+      return;
+    case RULE_NOTIFY_TRASH_ACTION_ID:
+      await handleTrashNotification({ context, event, logger });
+      return;
+    case RULE_NOTIFY_MARK_SPAM_ACTION_ID:
+      await handleMarkSpamNotification({ context, event, logger });
       return;
     default:
       await postNotificationFeedback({
@@ -658,6 +673,51 @@ export async function handleSlackRuleNotificationModalSubmit({
   }
 
   return { action: "close" };
+}
+
+function getRuleNotificationActionSelection(event: ActionEvent): {
+  actionId: string;
+  executedActionId: string;
+} | null {
+  const value = event.value?.trim();
+  if (!value) return null;
+
+  if (event.actionId !== RULE_NOTIFY_MORE_ACTION_ID) {
+    if (!isDirectRuleNotificationActionId(event.actionId)) return null;
+
+    return {
+      actionId: event.actionId,
+      executedActionId: value,
+    };
+  }
+
+  const separatorIndex = value.indexOf(":");
+  if (separatorIndex <= 0 || separatorIndex === value.length - 1) return null;
+
+  const selectedActionId = value.slice(0, separatorIndex);
+  if (
+    selectedActionId !== RULE_NOTIFY_TRASH_ACTION_ID &&
+    selectedActionId !== RULE_NOTIFY_MARK_SPAM_ACTION_ID
+  ) {
+    return null;
+  }
+
+  return {
+    actionId: selectedActionId,
+    executedActionId: value.slice(separatorIndex + 1),
+  };
+}
+
+function isDirectRuleNotificationActionId(actionId: string) {
+  return (
+    actionId === RULE_DRAFT_SEND_ACTION_ID ||
+    actionId === RULE_DRAFT_EDIT_ACTION_ID ||
+    actionId === RULE_DRAFT_DISMISS_ACTION_ID ||
+    actionId === RULE_NOTIFY_ARCHIVE_ACTION_ID ||
+    actionId === RULE_NOTIFY_MARK_READ_ACTION_ID ||
+    actionId === RULE_NOTIFY_TRASH_ACTION_ID ||
+    actionId === RULE_NOTIFY_MARK_SPAM_ACTION_ID
+  );
 }
 
 async function handleDraftSend({
@@ -971,6 +1031,60 @@ async function handleMarkReadNotification({
         context.executedRule.rule?.systemType ?? null,
       ),
       message: "Marked as read.",
+    }),
+  );
+}
+
+async function handleTrashNotification({
+  context,
+  event,
+  logger,
+}: {
+  context: NotificationContext;
+  event: ActionEvent;
+  logger: Logger;
+}) {
+  const provider = await createProviderForContext(context, logger);
+
+  await provider.trashThread(
+    context.executedRule.threadId,
+    context.executedRule.emailAccount.email,
+    "user",
+  );
+
+  await event.adapter.editMessage(
+    event.threadId,
+    event.messageId,
+    buildTerminalCard({
+      title: getInfoNotificationTitle(
+        context.executedRule.rule?.systemType ?? null,
+      ),
+      message: "Moved to trash.",
+    }),
+  );
+}
+
+async function handleMarkSpamNotification({
+  context,
+  event,
+  logger,
+}: {
+  context: NotificationContext;
+  event: ActionEvent;
+  logger: Logger;
+}) {
+  const provider = await createProviderForContext(context, logger);
+
+  await provider.markSpam(context.executedRule.threadId);
+
+  await event.adapter.editMessage(
+    event.threadId,
+    event.messageId,
+    buildTerminalCard({
+      title: getInfoNotificationTitle(
+        context.executedRule.rule?.systemType ?? null,
+      ),
+      message: "Marked as spam.",
     }),
   );
 }
@@ -1366,6 +1480,27 @@ function buildNotificationCard({
               label: "Mark read",
               value: actionId,
             }),
+            Select({
+              id: RULE_NOTIFY_MORE_ACTION_ID,
+              label: "More",
+              placeholder: "More actions",
+              options: [
+                SelectOption({
+                  label: "Delete",
+                  value: getMoreNotificationActionValue({
+                    actionId,
+                    selectedActionId: RULE_NOTIFY_TRASH_ACTION_ID,
+                  }),
+                }),
+                SelectOption({
+                  label: "Spam",
+                  value: getMoreNotificationActionValue({
+                    actionId,
+                    selectedActionId: RULE_NOTIFY_MARK_SPAM_ACTION_ID,
+                  }),
+                }),
+              ],
+            }),
           ],
     ),
   );
@@ -1387,6 +1522,16 @@ function buildTerminalCard({
     title,
     children: [CardText(message)],
   });
+}
+
+function getMoreNotificationActionValue({
+  actionId,
+  selectedActionId,
+}: {
+  actionId: string;
+  selectedActionId: string;
+}) {
+  return `${selectedActionId}:${actionId}`;
 }
 
 function buildTelegramNotificationCard({
