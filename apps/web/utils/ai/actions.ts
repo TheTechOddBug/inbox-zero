@@ -174,6 +174,7 @@ const draft: ActionFunction<{
   cc?: string | null;
   bcc?: string | null;
   staticAttachments?: ActionItem["staticAttachments"];
+  selectedAttachments?: ActionItem["selectedAttachments"];
 }> = async ({ client, email, args, emailAccount, executedRule, logger }) => {
   if (env.NEXT_PUBLIC_AUTO_DRAFT_DISABLED) return;
 
@@ -214,6 +215,7 @@ const draft: ActionFunction<{
     executedRule,
     logger,
     staticAttachments: args.staticAttachments,
+    selectedAttachments: args.selectedAttachments,
     includeAiSelectedAttachments: true,
   });
 
